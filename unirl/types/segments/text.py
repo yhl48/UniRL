@@ -37,6 +37,10 @@ class TextSegment(Segment):
     tokens: Optional[torch.Tensor] = packed_field(default=None)
     log_probs: Optional[torch.Tensor] = packed_field(default=None)
     loss_mask: Optional[torch.Tensor] = packed_field(default=None)
+    # PPO / GAE path (optional): per-token critic and advantage plumbing.
+    values: Optional[torch.Tensor] = packed_field(default=None)
+    returns: Optional[torch.Tensor] = packed_field(default=None)
+    token_advantages: Optional[torch.Tensor] = packed_field(default=None)
 
     def as_condition_with(self, encoder: Callable[..., Any]) -> Condition:
         """Re-embed packed tokens via the supplied encoder into a TextEmbedCondition.

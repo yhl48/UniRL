@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from unirl.types.advantages import compute_gae_advantages
+from unirl.types.advantages import compute_gae_advantages, scatter_terminal_rewards
 
 
 def test_gae_hand_computed_lambda_one() -> None:
@@ -107,3 +107,11 @@ def test_gae_single_step() -> None:
     advantages, returns = compute_gae_advantages(rewards, values, gamma=1.0, gae_lambda=0.95)
     assert math.isclose(float(advantages.item()), 0.75, rel_tol=0, abs_tol=1e-6)
     assert math.isclose(float(returns.item()), 1.0, rel_tol=0, abs_tol=1e-6)
+
+
+def test_scatter_terminal_rewards_packed() -> None:
+    lengths = torch.tensor([2, 1])
+    cu = torch.tensor([0, 2, 3])
+    rewards = torch.tensor([1.0, 0.0])
+    out = scatter_terminal_rewards(rewards, lengths=lengths, cu_seqlens=cu)
+    assert out.tolist() == [0.0, 1.0, 0.0]

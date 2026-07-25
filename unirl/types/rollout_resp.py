@@ -43,8 +43,9 @@ Pairs with ``RolloutReq`` (in ``unirl/types/rollout_req.py``).
 
 from __future__ import annotations
 
+import copy
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import fields as dc_fields
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
@@ -59,10 +60,12 @@ from unirl.distributed.tensor.batch import (
     shared_field,
 )
 from unirl.distributed.tensor.ref import hydrate
+from unirl.types.advantages import compute_gae_advantages as _compute_gae
+from unirl.types.advantages import scatter_terminal_rewards
 from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
-from unirl.types.segments import Segment
+from unirl.types.segments import Segment, TextSegment
 from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
@@ -132,8 +135,6 @@ class RolloutTrack(Batch):
         (``sample_ids``, ``parent_ids``, ``parent_track``), rewards,
         advantages, and status.
         """
-        import copy
-
         light = copy.copy(self)
         light.conditions = {}
         light.segment = None
@@ -416,6 +417,99 @@ class RolloutTrack(Batch):
         else:
             adv = reshaped - mean
         return _track_with_field(self, "advantages", adv.flatten())
+
+    def compute_gae_advantages(
+        self,
+        *,
+        gamma: float = 1.0,
+        gae_lambda: float = 0.95,
+        use_loss_mask: bool = True,
+    ) -> "RolloutTrack":
+        """GAE advantages from per-token ``segment.values`` and scalar ``rewards``.
+
+        Writes packed ``segment.token_advantages`` and ``segment.returns``.
+        ``track.advantages`` is set to the per-sample mean of token advantages
+        (for logging / compatibility with existing wandb panels).
+
+        Requires a :class:`~unirl.types.segments.text.TextSegment` with
+        ``values``, ``lengths``, and ``cu_seqlens`` populated (typically by
+        ``ARStage.replay(..., return_values=True)``).
+
+        Args:
+            gamma: Discount factor passed to :func:`compute_gae_advantages`.
+            gae_lambda: GAE smoothing λ.
+            use_loss_mask: When ``segment.loss_mask`` is set, pass it as the
+                GAE validity mask (e.g. response-only tokens).
+
+        Returns:
+            A new :class:`RolloutTrack` with GAE fields attached.
+        """
+        if self.rewards is None:
+            raise ValueError("RolloutTrack.compute_gae_advantages: track has no rewards")
+        if self.segment is None or not isinstance(self.segment, TextSegment):
+            raise ValueError(
+                "RolloutTrack.compute_gae_advantages: requires a TextSegment with values"
+            )
+        segment = self.segment
+        if segment.values is None:
+            raise ValueError("RolloutTrack.compute_gae_advantages: segment.values is None")
+        if segment.lengths is None or segment.cu_seqlens is None:
+            raise ValueError(
+                "RolloutTrack.compute_gae_advantages: segment requires framework-managed "
+                "cu_seqlens (construct via TextSegment.pack)"
+            )
+
+        values = hydrate(segment.values).to(torch.float32)
+        lengths = segment.lengths.to(device=values.device)
+        cu_seqlens = segment.cu_seqlens.to(device=values.device)
+        rewards_local = hydrate(self.rewards).to(device=values.device, dtype=torch.float32)
+        token_rewards = scatter_terminal_rewards(
+            rewards_local, lengths=lengths, cu_seqlens=cu_seqlens
+        )
+        mask = None
+        if use_loss_mask and segment.loss_mask is not None:
+            mask = hydrate(segment.loss_mask).to(device=values.device, dtype=values.dtype)
+
+        # Run GAE per packed trajectory so λ-carry and bootstrap reset at each
+        # sample boundary (a single 1D pass would leak across cu_seqlens gaps).
+        cu = [int(c) for c in cu_seqlens.tolist()]
+        token_adv = values.new_zeros(values.shape)
+        token_returns = values.new_zeros(values.shape)
+        for b, n in enumerate(lengths.tolist()):
+            n = int(n)
+            if n <= 0:
+                continue
+            start = cu[b]
+            sl_rewards = token_rewards[start : start + n]
+            sl_values = values[start : start + n]
+            sl_mask = mask[start : start + n] if mask is not None else None
+            adv, ret = _compute_gae(
+                sl_rewards,
+                sl_values,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                mask=sl_mask,
+            )
+            token_adv[start : start + n] = adv
+            token_returns[start : start + n] = ret
+
+        updated_segment = replace(
+            segment,
+            token_advantages=token_adv,
+            returns=token_returns,
+        )
+        # Per-sample mean for existing track-level advantage metrics.
+        sample_adv: List[torch.Tensor] = []
+        for b, n in enumerate(lengths.tolist()):
+            n = int(n)
+            if n <= 0:
+                sample_adv.append(token_adv.new_zeros(()))
+                continue
+            sample_adv.append(token_adv[cu[b] : cu[b] + n].mean())
+        track_adv = torch.stack(sample_adv) if sample_adv else token_adv.new_zeros((0,))
+
+        updated = _track_with_field(self, "segment", updated_segment)
+        return _track_with_field(updated, "advantages", track_adv)
 
 
 def _root_group_per_sample(resp: "RolloutResp", track_name: str) -> List[str]:
